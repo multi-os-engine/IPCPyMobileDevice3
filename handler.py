@@ -212,8 +212,8 @@ def get_device(id, device_id, ipc_client):
         with create_using_usbmux(device_id, autopair=False) as lockdown:
             reply = {"id": id, "state": "completed", "result": lockdown.short_info}
             write_dispatcher.write_reply(ipc_client, reply)
-    except Union[NoDeviceConnectedError, DeviceNotFoundError]:
-        reply = {"id": id, "state": "no_device"}
+    except (NoDeviceConnectedError, DeviceNotFoundError):
+        reply = {"id": id, "state": "failed_no_device"}
         write_dispatcher.write_reply(ipc_client, reply)
 
 def install_app(id, lockdown_client, path, mode, ipc_client):
@@ -261,7 +261,7 @@ def get_installed_path(id, lockdown_client, bundle_identifier, ipc_client):
         res = installer.lookup(options={"BundleIDs" : [bundle_identifier]})
 
         if bundle_identifier not in res:
-            reply = {"id": id, "state": "not_installed"}
+            reply = {"id": id, "state": "failed_not_installed"}
         else:
             reply = {"id": id, "state": "completed", "result": res[bundle_identifier]["Path"]}
 
@@ -343,7 +343,7 @@ def debugserver_connect(id, lockdown, port, ipc_client):
         if not discovery_service:
             raise TunneldConnectionError()
     except TunneldConnectionError:
-        reply = {"id":id, "state": "failed_tunneld"}
+        reply = {"id":id, "state": "failed_no_tunneld"}
         write_dispatcher.write_reply(ipc_client, reply)
         return
 
@@ -490,7 +490,7 @@ def handle_command(command, ipc_client):
         return
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("Usage: python handler.py <port_file>")
         sys.exit(1)
 
@@ -499,7 +499,7 @@ def main():
     server.listen(5)
 
     port = server.getsockname()[1]
-    path = sys.argv[2]
+    path = sys.argv[1]
 
     with open(path, "w") as f:
         f.write(str(port))
