@@ -14,27 +14,22 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-import atexit
 import json
 import os
 import platform
-import queue
-import select
-import subprocess
 import sys
 import threading
 import traceback
 from pathlib import Path
+
 import asyncio
-
-from time import sleep
-from typing import Union
-
-import requests
-from packaging.version import Version
-
+import plistlib
+import socket
+import aiohttp
 import pymobiledevice3.usbmux as usbmux
+from packaging.version import Version
 from pymobiledevice3.exceptions import *
+from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.remote.common import TunnelProtocol
 from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from pymobiledevice3.services.mobile_image_mounter import auto_mount
@@ -42,193 +37,120 @@ from pymobiledevice3.tcp_forwarder import LockdownTcpForwarder, UsbmuxTcpForward
 from pymobiledevice3.tunneld.api import get_tunneld_device_by_udid, TUNNELD_DEFAULT_ADDRESS
 from pymobiledevice3.tunneld.server import TunneldRunner
 from pymobiledevice3.usbmux import *
-from pymobiledevice3.lockdown import create_using_usbmux
-import plistlib
 
-IPC_VERSION = 3
+IPC_VERSION = 4
 
-class ConnectionResource:
-    def close(self):
-        raise NotImplementedError()
+# Global event used to signal graceful shutdown from the "exit" command.
+_shutdown_event: asyncio.Event | None = None
 
-class TcpForwarderResource(ConnectionResource):
+class TcpForwarderResource:
 
-    def __init__(self, forwarder: TcpForwarderBase, thread):
+    def __init__(self, forwarder: TcpForwarderBase, task: asyncio.Task):
         self.forwarder = forwarder
-        self.thread = thread
+        self.task = task
 
-    def close(self):
+    async def close(self):
         self.forwarder.stop()
-        self.thread.join(5)
-
-        if self.thread.is_alive():
-            print(f"Joining forwarder thread {self.forwarder.src_port} timed out")
-
+        try:
+            await asyncio.wait_for(self.task, timeout=5)
+        except asyncio.TimeoutError:
+            print(f"Joining forwarder task {self.forwarder.src_port} timed out")
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
 
 class IPCClient:
-    def __init__(self, sock, address, version):
-        self.sock = sock
-        self.read_file = sock.makefile('r')
-        self.write_file = sock.makefile('w')
+    def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, address, version):
+        self.reader = reader
+        self.writer = writer
         self.address = address
         self.version = version
         self.active_forwarder: dict[int, TcpForwarderResource] = {}
+        self._write_lock = asyncio.Lock()
+        self._command_tasks: set[asyncio.Task] = set()
 
-    def close(self):
+    def track_task(self, task: asyncio.Task):
+        """Register a command task so it can be cleaned up on disconnect."""
+        self._command_tasks.add(task)
+        task.add_done_callback(self._command_tasks.discard)
+
+    async def close(self):
+        # Cancel all in-flight command tasks and wait for them to finish.
+        for task in self._command_tasks:
+            task.cancel()
+        if self._command_tasks:
+            await asyncio.gather(*self._command_tasks, return_exceptions=True)
+        self._command_tasks.clear()
+
         for resource in self.active_forwarder.values():
-            resource.close()
+            await resource.close()
+
         self.active_forwarder.clear()
 
-        self.sock.close()
-        self.read_file.close()
-        self.write_file.close()
+        self.writer.close()
+        try:
+            await self.writer.wait_closed()
+        except Exception:
+            pass
 
     def add_forwarder(self, local_port: int, forwarder: TcpForwarderResource):
         if local_port in self.active_forwarder:
             raise ValueError(f"{local_port} already has an open connection: {self.active_forwarder[local_port]}")
         self.active_forwarder[local_port] = forwarder
 
-    def close_forwarder(self, local_port: int):
+    async def close_forwarder(self, local_port: int):
         if local_port not in self.active_forwarder:
             raise ValueError(f"Port {local_port} is not open")
         forwarder = self.active_forwarder.pop(local_port)
-        forwarder.close()
+        await forwarder.close()
 
-class WriteDispatcher:
-    def __init__(self):
-        self.write_queue = queue.Queue()
-        self.shutdown_event = threading.Event()
-        self.write_thread = threading.Thread(target=self._write_worker, daemon=True, name="Python-WriteDispatcher")
-        self.write_thread.start()
-
-    def _write_worker(self):
-        try:
-            while True:
-                try:
-                    writer, message = self.write_queue.get()
-                    if message is None:
-                        break
-
-                    writer.write(str(message))
-                    writer.write("\n")
-                    writer.flush()
-
-                except Exception as e:
-                    print(f"Write thread error: {e}")
-                    continue
-        finally:
-            self.shutdown_event.set()
-
-    def write_reply(self, ipc_client, reply: dict):
-        if self.shutdown_event.is_set():
-            return
-        print(f"{ipc_client.address}: Sending packet: {str(reply)}")
-        self.write_queue.put((ipc_client.write_file, reply))
-
-    def shutdown(self):
-        self.write_queue.put(None)
-        self.write_thread.join()
-
-class ReadDispatcher:
-    def __init__(self):
-        self.socket_list = []
-        self.clients = {}
-        self.shutdown_event = threading.Event()
-        self.read_thread = threading.Thread(target=self._read_worker, daemon=True, name="Python-ReadDispatcher")
-        self.read_thread.start()
-
-    def _read_worker(self):
-        try:
-            while True:
-                try:
-                    ready_sockets, _, exception_sockets = select.select(self.socket_list, [], self.socket_list, 1.0)
-
-                    if self.shutdown_event.is_set():
-                        for sock in self.socket_list:
-                            self.remove_client(self.clients[sock])
-                        return
-
-                    for exception_socket in exception_sockets:
-                        self.remove_client(self.clients[exception_socket])
-
-                    for ready_socket in ready_sockets:
-                        ipc_client = self.clients[ready_socket]
-                        command = ipc_client.read_file.readline().strip()
-                        if not command:
-                            self.remove_client(ipc_client)
-                            continue
-                        print(f"{ipc_client.address}: Received command: {command}")
-
-                        handle_command(command, ipc_client)
-
-                except Exception as e:
-                    print(f"Read thread error: {e}")
-                    continue
-        finally:
-            self.shutdown_event.set()
-
-    def remove_client(self, ipc_client):
-        self.socket_list.remove(ipc_client.sock)
-        self.clients.pop(ipc_client.sock)
-        ipc_client.close()
-        print(f"Disconnected {ipc_client.address}")
-
-    def add_client(self, ipc_client):
-        self.clients[ipc_client.sock] = ipc_client
-        self.socket_list.append(ipc_client.sock)
-        print(f"Connected {ipc_client.address} with version {ipc_client.version}")
+    async def write_reply(self, reply: dict):
+        message = json.dumps(reply)
+        print(f"{self.address}: Sending packet: {message}")
+        async with self._write_lock:
+            self.writer.write(message.encode() + b"\n")
+            await self.writer.drain()
 
 
-    def shutdown(self):
-        self.shutdown_event.set()
-
-write_dispatcher = WriteDispatcher()
-read_dispatcher = ReadDispatcher()
-
-
-def list_devices(id, ipc_client):
+async def list_devices(id, ipc_client):
     devices = []
-    for device in usbmux.list_devices():
+    for device in await usbmux.list_devices():
         udid = device.serial
-
-        with create_using_usbmux(udid, autopair=False, connection_type=device.connection_type) as lockdown:
+        async with await create_using_usbmux(udid, autopair=False, connection_type=device.connection_type) as lockdown:
             devices.append(lockdown.short_info)
 
-    reply = {"id": id, "state": "completed", "result": devices}
+    await ipc_client.write_reply({"id": id, "state": "completed", "result": devices})
 
-    write_dispatcher.write_reply(ipc_client, reply)
 
-def list_devices_udid(id, ipc_client):
+async def list_devices_udid(id, ipc_client):
     devices = []
-    for device in usbmux.list_devices():
+    for device in await usbmux.list_devices():
         devices.append(device.serial)
 
-    reply = {"id": id, "state": "completed", "result": devices}
+    await ipc_client.write_reply({"id": id, "state": "completed", "result": devices})
 
-    write_dispatcher.write_reply(ipc_client, reply)
 
-def get_device(id, device_id, ipc_client):
+async def get_device(id, device_id, ipc_client):
     try:
-        with create_using_usbmux(device_id, autopair=False) as lockdown:
-            reply = {"id": id, "state": "completed", "result": lockdown.short_info}
-            write_dispatcher.write_reply(ipc_client, reply)
+        async with await create_using_usbmux(device_id, autopair=False) as lockdown:
+            await ipc_client.write_reply({"id": id, "state": "completed", "result": lockdown.short_info})
     except (NoDeviceConnectedError, DeviceNotFoundError):
-        reply = {"id": id, "state": "failed_no_device"}
-        write_dispatcher.write_reply(ipc_client, reply)
+        await ipc_client.write_reply({"id": id, "state": "failed_no_device"})
 
-def install_app(id, lockdown_client, path, mode, ipc_client):
-    with InstallationProxyService(lockdown=lockdown_client) as installer:
+
+async def install_app(id, lockdown_client, path, mode, ipc_client):
+    async with InstallationProxyService(lockdown=lockdown_client) as installer:
         options = {"PackageType": "Developer"}
 
         def progress_handler(progress, *args):
-            reply = {"id": id, "state": "progress", "progress": progress}
-            write_dispatcher.write_reply(ipc_client, reply)
-            return
+            asyncio.ensure_future(ipc_client.write_reply({"id": id, "state": "progress", "progress": progress}))
 
         if mode == "INSTALL":
-            installer.install(path, options=options, handler=progress_handler)
+            await installer.install_from_local(path, cmd="Install", options=options, handler=progress_handler)
         elif mode == "UPGRADE":
-            installer.upgrade(path, options=options, handler=progress_handler)
+            await installer.install_from_local(path, cmd="Upgrade", options=options, handler=progress_handler)
         else:
             raise RuntimeError(f"Invalid mode [{mode}]")
 
@@ -238,289 +160,338 @@ def install_app(id, lockdown_client, path, mode, ipc_client):
             plist_data = plistlib.load(f)
 
         bundle_identifier = plist_data["CFBundleIdentifier"]
+        res = await installer.lookup(options={"BundleIDs": [bundle_identifier]})
 
-        res = installer.lookup(options={"BundleIDs" : [bundle_identifier]})
-
-        reply = {"id": id, "state": "completed", "result": res[bundle_identifier]["Path"]}
-        write_dispatcher.write_reply(ipc_client, reply)
-
+        await ipc_client.write_reply({"id": id, "state": "completed", "result": res[bundle_identifier]["Path"]})
         print("Installed bundle: " + str(bundle_identifier))
 
-def get_bundle_identifier(id, path, ipc_client):
+async def get_bundle_identifier(id, path, ipc_client):
     info_plist_path = Path(path) / "Info.plist"
     with open(info_plist_path, 'rb') as f:
         plist_data = plistlib.load(f)
 
     bundle_identifier = plist_data["CFBundleIdentifier"]
+    await ipc_client.write_reply({"id": id, "state": "completed", "result": bundle_identifier})
 
-    reply = {"id": id, "state": "completed", "result": bundle_identifier}
-    write_dispatcher.write_reply(ipc_client, reply)
 
-def get_installed_path(id, lockdown_client, bundle_identifier, ipc_client):
-    with InstallationProxyService(lockdown=lockdown_client) as installer:
-        res = installer.lookup(options={"BundleIDs" : [bundle_identifier]})
+async def get_installed_path(id, lockdown_client, bundle_identifier, ipc_client):
+    async with InstallationProxyService(lockdown=lockdown_client) as installer:
+        res = await installer.lookup(options={"BundleIDs": [bundle_identifier]})
 
         if bundle_identifier not in res:
             reply = {"id": id, "state": "failed_not_installed"}
         else:
             reply = {"id": id, "state": "completed", "result": res[bundle_identifier]["Path"]}
 
-        write_dispatcher.write_reply(ipc_client, reply)
+        await ipc_client.write_reply(reply)
 
-def decode_plist(id, path, ipc_client):
+async def decode_plist(id, path, ipc_client):
     with open(path, 'rb') as f:
         plist_data = plistlib.load(f)
-        reply = {"id": id, "state": "completed", "result": plist_data}
-        write_dispatcher.write_reply(ipc_client, reply)
-        return
+        await ipc_client.write_reply({"id": id, "state": "completed", "result": plist_data})
 
-def auto_mount_image(id, lockdown, ipc_client):
+async def auto_mount_image(id, lockdown, ipc_client):
     try:
-        asyncio.run(auto_mount(lockdown))
+        await auto_mount(lockdown)
     except AlreadyMountedError:
         pass
-    reply = {"id": id, "state": "completed"}
-    write_dispatcher.write_reply(ipc_client, reply)
+    await ipc_client.write_reply({"id": id, "state": "completed"})
 
 
-def start_tunneld():
+async def start_tunneld():
     if platform.system() == "Darwin":
         print("Starting tunneld as process")
         python_executable = sys.executable
-        start_script = f'do shell script "sudo {python_executable} -m pymobiledevice3 remote tunneld" with administrator privileges'
-        print("Running \"" + start_script + "\"")
-        process = subprocess.Popen(['osascript', '-e', start_script], stdout=None, stderr=None)
+        start_script = f'do shell script "sudo {python_executable} -m pymobiledevice3 remote tunneld --no-usb --no-wifi --no-mobdev2" with administrator privileges'
+        print(f'Running "{start_script}"')
+        process = await asyncio.create_subprocess_exec(
+            'osascript', '-e', start_script,
+            stdout=None, stderr=None
+        )
         print(f"Started tunneld process with pid {process.pid}")
     else:
-        print("Starting tunneld as thread")
-        def _worker():
-            TunneldRunner.create(*TUNNELD_DEFAULT_ADDRESS, protocol=TunnelProtocol.DEFAULT)
+        print("Starting tunneld as task")
 
-        webserver_thread = threading.Thread(target=_worker, daemon=True, name="Python-Tunneld")
-        webserver_thread.start()
+        asyncio.create_task(asyncio.to_thread(
+            TunneldRunner.create, *TUNNELD_DEFAULT_ADDRESS, protocol=TunnelProtocol.DEFAULT
+        ))
 
     for i in range(60):
-        if is_tunneld_running():
+        if await is_tunneld_running():
             print("tunneld successfully started")
             return
-        sleep(1)
+        await asyncio.sleep(1)
     raise RuntimeError("Failed launching tunneld service")
 
-def is_tunneld_running():
-    try:
-        response = requests.get(f"http://{TUNNELD_DEFAULT_ADDRESS[0]}:{TUNNELD_DEFAULT_ADDRESS[1]}/hello")
-        if response.status_code != 200:
-            raise RuntimeError()
 
-        data = response.json()
-        if data.get("message") != "Hello, I'm alive":
-            raise RuntimeError()
-        # Tunneld seems running happily
-        return True
+async def is_tunneld_running():
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"http://{TUNNELD_DEFAULT_ADDRESS[0]}:{TUNNELD_DEFAULT_ADDRESS[1]}/hello") as response:
+                if response.status != 200:
+                    return False
+                data = await response.json()
+                return data.get("message") == "Hello, I'm alive"
     except Exception:
         return False
 
-def shutdown_tunneld():
-    if is_tunneld_running():
+async def shutdown_tunneld():
+    if await is_tunneld_running():
         try:
-            response = requests.get(f"http://{TUNNELD_DEFAULT_ADDRESS[0]}:{TUNNELD_DEFAULT_ADDRESS[1]}/shutdown")
-            if response.status_code != 200:
-                raise RuntimeError("Status code was " + str(response.status_code))
-            print("tunneld shutdown request successful")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://{TUNNELD_DEFAULT_ADDRESS[0]}:{TUNNELD_DEFAULT_ADDRESS[1]}/shutdown") as response:
+                    if response.status != 200:
+                        raise RuntimeError("Status code was " + str(response.status))
+                    print("tunneld shutdown request successful")
         except Exception as e:
             print("Failed tunneld teardown", e)
 
-def ensure_tunneld_running():
-    if not is_tunneld_running():
-        start_tunneld()
+async def ensure_tunneld_running():
+    if not await is_tunneld_running():
+        await start_tunneld()
         print("tunneld is not running - starting")
     else:
         print("tunneld is already running")
 
-def debugserver_connect(id, lockdown, port, ipc_client):
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('localhost', 0))
+        return s.getsockname()[1]
+
+
+async def _start_forwarder(forwarder, listen_event):
+    """Start a forwarder task and wait for it to begin listening.
+
+    Returns the task on success.  On timeout the task is cancelled and
+    cleaned up before the exception propagates.
+    """
+    task = asyncio.create_task(forwarder.start())
     try:
-        discovery_service = get_tunneld_device_by_udid(lockdown.udid)
+        await asyncio.wait_for(asyncio.to_thread(listen_event.wait), timeout=10)
+    except (asyncio.TimeoutError, Exception):
+        if task.done():
+            task.result()  # re-raises the actual exception
+        # Forwarder never started listening — clean up.
+        forwarder.stop()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise
+    return task
+
+
+async def debugserver_connect(id, lockdown, port, ipc_client):
+    try:
+        discovery_service = await get_tunneld_device_by_udid(lockdown.udid)
         if not discovery_service:
             raise TunneldConnectionError()
     except TunneldConnectionError:
-        reply = {"id":id, "state": "failed_no_tunneld"}
-        write_dispatcher.write_reply(ipc_client, reply)
+        await ipc_client.write_reply({"id": id, "state": "failed_no_tunneld"})
         return
 
     if Version(discovery_service.product_version) < Version('17.0'):
         service_name = 'com.apple.debugserver.DVTSecureSocketProxy'
     else:
         service_name = 'com.apple.internal.dt.remote.debugproxy'
+
+    if port == 0:
+        port = find_free_port()
+
     listen_event = threading.Event()
     forwarder = LockdownTcpForwarder(discovery_service, port, service_name, listening_event=listen_event)
+    task = await _start_forwarder(forwarder, listen_event)
+    ipc_client.add_forwarder(port, TcpForwarderResource(forwarder, task))
 
-    def forwarder_thread():
-        forwarder.start()
-
-    thread = threading.Thread(target=forwarder_thread, daemon=True)
-    thread.start()
-
-    listen_event.wait()
-    selected_port = forwarder.server_socket.getsockname()[1]
-
-    resource = TcpForwarderResource(forwarder, thread)
-    ipc_client.add_forwarder(selected_port, resource)
-
-    reply = {"id": id, "state": "completed", "result": {
+    await ipc_client.write_reply({"id": id, "state": "completed", "result": {
         "host": "127.0.0.1",
-        "port": selected_port
-    }}
-    write_dispatcher.write_reply(ipc_client, reply)
+        "port": port
+    }})
 
 
-def debugserver_close(id, port, ipc_client):
-    ipc_client.close_forwarder(port)
-
-    reply = {"id": id, "state": "completed"}
-    write_dispatcher.write_reply(ipc_client, reply)
+async def debugserver_close(id, port, ipc_client):
+    await ipc_client.close_forwarder(port)
+    await ipc_client.write_reply({"id": id, "state": "completed"})
 
 
-def usbmux_forward_open(id, udid, remote_port, local_port, ipc_client):
+async def usbmux_forward_open(id, udid, remote_port, local_port, ipc_client):
+    if local_port == 0:
+        local_port = find_free_port()
+
     listen_event = threading.Event()
-
     forwarder = UsbmuxTcpForwarder(udid, remote_port, local_port, listening_event=listen_event)
+    task = await _start_forwarder(forwarder, listen_event)
 
-    def forwarder_thread():
-        forwarder.start()
+    ipc_client.add_forwarder(local_port, TcpForwarderResource(forwarder, task))
 
-    thread = threading.Thread(target=forwarder_thread, daemon=True)
-    thread.start()
-
-    listen_event.wait()
-    selected_port = forwarder.server_socket.getsockname()[1]
-
-    resource = TcpForwarderResource(forwarder, thread)
-    ipc_client.add_forwarder(selected_port, resource)
-
-    reply = {"id": id, "state": "completed", "result": {
+    await ipc_client.write_reply({"id": id, "state": "completed", "result": {
         "host": "127.0.0.1",
-        "local_port": selected_port,
+        "local_port": local_port,
         "remote_port": remote_port
-    }}
-    write_dispatcher.write_reply(ipc_client, reply)
+    }})
 
 
-def usbmux_forward_close(id, local_port, ipc_client):
-    ipc_client.close_forwarder(local_port)
+async def usbmux_forward_close(id, local_port, ipc_client):
+    await ipc_client.close_forwarder(local_port)
+    await ipc_client.write_reply({"id": id, "state": "completed"})
 
-    reply = {"id": id, "state": "completed"}
-    write_dispatcher.write_reply(ipc_client, reply)
 
-def get_version(id, ipc_client):
-    reply = {"id": id, "state": "completed", "result": IPC_VERSION}
-    write_dispatcher.write_reply(ipc_client, reply)
+async def get_version(id, ipc_client):
+    await ipc_client.write_reply({"id": id, "state": "completed", "result": IPC_VERSION})
 
-def handle_command(command, ipc_client):
+
+async def handle_command(command, ipc_client):
     try:
         res = json.loads(command)
         id = res['id']
     except Exception as e:
-        reply = {"request": command, "state": "failed", "error": repr(e), "backtrace": traceback.format_exc()}
-        write_dispatcher.write_reply(ipc_client, reply)
+        try:
+            await ipc_client.write_reply({"request": command, "state": "failed", "error": repr(e), "backtrace": traceback.format_exc()})
+        except Exception:
+            print(f"{ipc_client.address}: Failed to send parse error reply (client disconnected?)")
         return
 
     try:
         command_type = res['command']
         if command_type == "exit":
             print(f"Exiting by request from {ipc_client.address}")
-            atexit._run_exitfuncs()
-            os._exit(0)
+            await shutdown_tunneld()
+            # Signal the server loop to shut down gracefully.
+            if _shutdown_event is not None:
+                _shutdown_event.set()
+            return
         elif command_type == "list_devices":
-            list_devices(id, ipc_client)
-            return
+            await list_devices(id, ipc_client)
         elif command_type == "list_devices_udid":
-            list_devices_udid(id, ipc_client)
-            return
+            await list_devices_udid(id, ipc_client)
         elif command_type == "get_device":
-            device_id = res['device_id'] if 'device_id' in res else None
-            get_device(id, device_id, ipc_client)
-            return
+            device_id = res.get('device_id')
+            await get_device(id, device_id, ipc_client)
         elif command_type == "decode_plist":
-            decode_plist(id, res['plist_path'], ipc_client)
-            return
+            await decode_plist(id, res['plist_path'], ipc_client)
         elif command_type == "debugserver_close":
-            debugserver_close(id, res['port'], ipc_client)
-            return
+            await debugserver_close(id, res['port'], ipc_client)
         elif command_type == "usbmux_forwarder_open":
-            usbmux_forward_open(id, res['device_id'], res['remote_port'], res['local_port'], ipc_client)
-            return
+            await usbmux_forward_open(id, res['device_id'], res['remote_port'], res['local_port'], ipc_client)
         elif command_type == "usbmux_forwarder_close":
-            usbmux_forward_close(id, res['local_port'], ipc_client)
-            return
+            await usbmux_forward_close(id, res['local_port'], ipc_client)
         elif command_type == "ensure_tunneld_running":
-            ensure_tunneld_running()
-            reply = {"id": id, "state": "completed"}
-            write_dispatcher.write_reply(ipc_client, reply)
-            return
+            await ensure_tunneld_running()
+            await ipc_client.write_reply({"id": id, "state": "completed"})
         elif command_type == "is_tunneld_running":
-            res = is_tunneld_running()
-            reply = {"id": id, "state": "completed", "result": res}
-            write_dispatcher.write_reply(ipc_client, reply)
-            return
+            result = await is_tunneld_running()
+            await ipc_client.write_reply({"id": id, "state": "completed", "result": result})
         elif command_type == "get_version":
-            get_version(id, ipc_client)
-            return
+            await get_version(id, ipc_client)
         elif command_type == "get_bundle_identifier":
-            get_bundle_identifier(id, res["app_path"], ipc_client)
+            await get_bundle_identifier(id, res["app_path"], ipc_client)
+        else:
+            # Device-targeted commands
+            device_id = res['device_id']
+            async with await create_using_usbmux(device_id) as lockdown:
+                if command_type == "install_app":
+                    await install_app(id, lockdown, res['app_path'], res['install_mode'], ipc_client)
+                elif command_type == "auto_mount_image":
+                    await auto_mount_image(id, lockdown, ipc_client)
+                elif command_type == "debugserver_connect":
+                    await debugserver_connect(id, lockdown, res['port'], ipc_client)
+                elif command_type == "get_installed_path":
+                    await get_installed_path(id, lockdown, res["bundle_identifier"], ipc_client)
+    except Exception as e:
+        try:
+            await ipc_client.write_reply({"id": id, "request": command, "state": "failed", "error": repr(e), "backtrace": traceback.format_exc()})
+        except Exception:
+            print(f"{ipc_client.address}: Failed to send error reply for command {id} (client disconnected?)")
+
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    address = writer.get_extra_info('peername')
+    try:
+        # Version handshake: read 1 byte (client version), send ours
+        version_data = await asyncio.wait_for(reader.read(1), timeout=2)
+        if not version_data:
+            print(f"{address}: Failed to receive version")
+            writer.close()
+            await writer.wait_closed()
             return
 
-        # Now come the device targetted functions
-        device_id = res['device_id']
-        with create_using_usbmux(device_id) as lockdown:
-            if command_type == "install_app":
-                install_app(id, lockdown, res['app_path'], res['install_mode'], ipc_client)
-                return
-            elif command_type == "auto_mount_image":
-                auto_mount_image(id, lockdown, ipc_client)
-                return
-            elif command_type == "debugserver_connect":
-                debugserver_connect(id, lockdown, res['port'], ipc_client)
-                return
-            elif command_type == "get_installed_path":
-                get_installed_path(id, lockdown, res["bundle_identifier"], ipc_client)
-                return
-    except Exception as e:
-        reply = {"id": id, "request": command, "state": "failed", "error": repr(e), "backtrace": traceback.format_exc()}
-        write_dispatcher.write_reply(ipc_client, reply)
+        java_protocol_version = version_data[0]
+        writer.write(bytes([IPC_VERSION]))
+        await writer.drain()
+
+        ipc_client = IPCClient(reader, writer, address, java_protocol_version)
+        print(f"Connected {address} with version {java_protocol_version}")
+    except Exception:
+        print(f"{address}: Failed to send version")
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
         return
 
-def main():
+    try:
+        while True:
+            line = await reader.readline()
+            if not line:
+                break
+            command = line.decode().strip()
+            if not command:
+                break
+            print(f"{address}: Received command: {command}")
+            # Each command runs as its own task so one slow command doesn't block the next from the same client.
+            # Tasks are tracked so they can be cancelled on disconnect.
+            task = asyncio.create_task(handle_command(command, ipc_client))
+            ipc_client.track_task(task)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f"{address}: Read error: {e}")
+    finally:
+        await ipc_client.close()
+        print(f"Disconnected {address}")
+
+
+async def async_main():
+    global _shutdown_event
+
     if len(sys.argv) < 2:
         print("Usage: python handler.py <port_file>")
         sys.exit(1)
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('localhost', 0))
-    server.listen(5)
+    _shutdown_event = asyncio.Event()
 
-    port = server.getsockname()[1]
+    server = await asyncio.start_server(handle_client, 'localhost', 0)
+    port = server.sockets[0].getsockname()[1]
     path = sys.argv[1]
 
     with open(path, "w") as f:
         f.write(str(port))
 
     print(f"Written port {port} to file {path}")
-
-    atexit.register(os.remove, path)
-    atexit.register(shutdown_tunneld)
     print(f"Start listening on port {port}")
-    while True:
-        client_socket, client_address = server.accept()
-        try:
-            reads, _, _ = select.select([client_socket], [], [], 2)
-            if client_socket not in reads:
-                raise RuntimeError()
-            java_protocol_version = client_socket.recv(1)[0]
-            client_socket.send(bytes([IPC_VERSION]))
 
-            read_dispatcher.add_client(IPCClient(client_socket, client_address, java_protocol_version))
-        except Exception:
-            print(f"{client_address}: Failed to send version")
+    try:
+        # Run until the shutdown event is set (by the "exit" command)
+        # or the server is cancelled externally.
+        async with server:
+            await _shutdown_event.wait()
+            print("Shutdown requested, closing server...")
+    except asyncio.CancelledError:
+        pass
+    finally:
+        server.close()
+        await server.wait_closed()
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def main():
+    asyncio.run(async_main())
 
 
 main()
