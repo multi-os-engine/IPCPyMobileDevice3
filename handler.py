@@ -18,13 +18,11 @@ import json
 import os
 import platform
 import sys
-import threading
 import traceback
 from pathlib import Path
 
 import asyncio
 import plistlib
-import socket
 import aiohttp
 import pymobiledevice3.usbmux as usbmux
 from packaging.version import Version
@@ -38,7 +36,7 @@ from pymobiledevice3.tunneld.api import get_tunneld_device_by_udid, TUNNELD_DEFA
 from pymobiledevice3.tunneld.server import TunneldRunner
 from pymobiledevice3.usbmux import *
 
-IPC_VERSION = 4
+IPC_VERSION = 5
 
 # Global event used to signal graceful shutdown from the "exit" command.
 _shutdown_event: asyncio.Event | None = None
@@ -254,12 +252,6 @@ async def ensure_tunneld_running():
         print("tunneld is already running")
 
 
-def find_free_port():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('localhost', 0))
-        return s.getsockname()[1]
-
-
 async def _start_forwarder(forwarder, listen_event):
     """Start a forwarder task and wait for it to begin listening.
 
@@ -268,8 +260,8 @@ async def _start_forwarder(forwarder, listen_event):
     """
     task = asyncio.create_task(forwarder.start())
     try:
-        await asyncio.wait_for(asyncio.to_thread(listen_event.wait), timeout=10)
-    except (asyncio.TimeoutError, Exception):
+        await asyncio.wait_for(listen_event.wait(), timeout=10)
+    except asyncio.TimeoutError:
         if task.done():
             task.result()  # re-raises the actual exception
         # Forwarder never started listening — clean up.
@@ -297,17 +289,15 @@ async def debugserver_connect(id, lockdown, port, ipc_client):
     else:
         service_name = 'com.apple.internal.dt.remote.debugproxy'
 
-    if port == 0:
-        port = find_free_port()
-
-    listen_event = threading.Event()
+    listen_event = asyncio.Event()
     forwarder = LockdownTcpForwarder(discovery_service, port, service_name, listening_event=listen_event)
     task = await _start_forwarder(forwarder, listen_event)
-    ipc_client.add_forwarder(port, TcpForwarderResource(forwarder, task))
+    resolved_port = forwarder.listening_port
+    ipc_client.add_forwarder(resolved_port, TcpForwarderResource(forwarder, task))
 
     await ipc_client.write_reply({"id": id, "state": "completed", "result": {
         "host": "127.0.0.1",
-        "port": port
+        "port": resolved_port
     }})
 
 
@@ -317,18 +307,16 @@ async def debugserver_close(id, port, ipc_client):
 
 
 async def usbmux_forward_open(id, udid, remote_port, local_port, ipc_client):
-    if local_port == 0:
-        local_port = find_free_port()
-
-    listen_event = threading.Event()
+    listen_event = asyncio.Event()
     forwarder = UsbmuxTcpForwarder(udid, remote_port, local_port, listening_event=listen_event)
     task = await _start_forwarder(forwarder, listen_event)
+    resolved_port = forwarder.listening_port
 
-    ipc_client.add_forwarder(local_port, TcpForwarderResource(forwarder, task))
+    ipc_client.add_forwarder(resolved_port, TcpForwarderResource(forwarder, task))
 
     await ipc_client.write_reply({"id": id, "state": "completed", "result": {
         "host": "127.0.0.1",
-        "local_port": local_port,
+        "local_port": resolved_port,
         "remote_port": remote_port
     }})
 
@@ -463,7 +451,11 @@ async def async_main():
 
     _shutdown_event = asyncio.Event()
 
-    server = await asyncio.start_server(handle_client, 'localhost', 0)
+    server = await asyncio.start_server(handle_client, '127.0.0.1', 0)
+    if len(server.sockets) != 1:
+        print("Somehow opened two ports??")
+        sys.exit(1)
+
     port = server.sockets[0].getsockname()[1]
     path = sys.argv[1]
 
@@ -488,6 +480,8 @@ async def async_main():
             os.remove(path)
         except OSError:
             pass
+
+    print("Closed server")
 
 
 def main():
