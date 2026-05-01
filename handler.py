@@ -36,7 +36,7 @@ from pymobiledevice3.tunneld.api import get_tunneld_device_by_udid, TUNNELD_DEFA
 from pymobiledevice3.tunneld.server import TunneldRunner
 from pymobiledevice3.usbmux import *
 
-IPC_VERSION = 5
+IPC_VERSION = 6
 
 # Global event used to signal graceful shutdown from the "exit" command.
 _shutdown_event: asyncio.Event | None = None
