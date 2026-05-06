@@ -23,6 +23,7 @@ from pathlib import Path
 
 import asyncio
 import plistlib
+from typing import Optional
 import aiohttp
 import pymobiledevice3.usbmux as usbmux
 from packaging.version import Version
@@ -39,7 +40,7 @@ from pymobiledevice3.usbmux import *
 IPC_VERSION = 6
 
 # Global event used to signal graceful shutdown from the "exit" command.
-_shutdown_event: asyncio.Event | None = None
+_shutdown_event: Optional[asyncio.Event] = None
 
 class TcpForwarderResource:
 
