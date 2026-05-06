@@ -1,7 +1,7 @@
 ## Overview
 
 This project exposes [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) via an JSon IPC protocol via TCP.  
-
+It is compatible with python 3.9+.
 
 ## How to launch
 It can be launched via `python3 handler.py <port_file>`.  
