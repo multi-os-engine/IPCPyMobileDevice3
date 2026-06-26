@@ -1,2 +1,1 @@
-pymobiledevice3==9.12.0
-aiohttp==3.13.3
+pymobiledevice3==9.30.1

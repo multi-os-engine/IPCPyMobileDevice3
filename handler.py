@@ -16,7 +16,6 @@
 
 import json
 import os
-import platform
 import sys
 import traceback
 from pathlib import Path
@@ -24,29 +23,26 @@ from pathlib import Path
 import asyncio
 import plistlib
 from typing import Optional
-import aiohttp
 import pymobiledevice3.usbmux as usbmux
 from packaging.version import Version
 from pymobiledevice3.exceptions import *
 from pymobiledevice3.lockdown import create_using_usbmux
-from pymobiledevice3.remote.common import TunnelProtocol
 from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from pymobiledevice3.services.mobile_image_mounter import auto_mount
 from pymobiledevice3.tcp_forwarder import LockdownTcpForwarder, UsbmuxTcpForwarder, TcpForwarderBase
-from pymobiledevice3.tunneld.api import get_tunneld_device_by_udid, TUNNELD_DEFAULT_ADDRESS
-from pymobiledevice3.tunneld.server import TunneldRunner
 from pymobiledevice3.usbmux import *
 
-IPC_VERSION = 7
+IPC_VERSION = 8
 
 # Global event used to signal graceful shutdown from the "exit" command.
 _shutdown_event: Optional[asyncio.Event] = None
 
 class TcpForwarderResource:
 
-    def __init__(self, forwarder: TcpForwarderBase, task: asyncio.Task):
+    def __init__(self, forwarder: TcpForwarderBase, task: asyncio.Task, service_provider=None):
         self.forwarder = forwarder
         self.task = task
+        self.service_provider = service_provider
 
     async def close(self):
         self.forwarder.stop()
@@ -59,6 +55,12 @@ class TcpForwarderResource:
                 await self.task
             except asyncio.CancelledError:
                 pass
+        finally:
+            if self.service_provider is not None:
+                try:
+                    await self.service_provider.close()
+                except Exception as e:
+                    print(f"Failed closing debugserver service provider: {e}")
 
 class IPCClient:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, address, version):
@@ -197,62 +199,6 @@ async def auto_mount_image(id, lockdown, ipc_client):
     await ipc_client.write_reply({"id": id, "state": "completed"})
 
 
-async def start_tunneld():
-    if platform.system() == "Darwin":
-        print("Starting tunneld as process")
-        python_executable = sys.executable
-        start_script = f'do shell script "sudo {python_executable} -m pymobiledevice3 remote tunneld --no-usb --no-wifi --no-mobdev2" with administrator privileges'
-        print(f'Running "{start_script}"')
-        process = await asyncio.create_subprocess_exec(
-            'osascript', '-e', start_script,
-            stdout=None, stderr=None
-        )
-        print(f"Started tunneld process with pid {process.pid}")
-    else:
-        print("Starting tunneld as task")
-
-        asyncio.create_task(asyncio.to_thread(
-            TunneldRunner.create, *TUNNELD_DEFAULT_ADDRESS, protocol=TunnelProtocol.DEFAULT
-        ))
-
-    for i in range(60):
-        if await is_tunneld_running():
-            print("tunneld successfully started")
-            return
-        await asyncio.sleep(1)
-    raise RuntimeError("Failed launching tunneld service")
-
-
-async def is_tunneld_running():
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"http://{TUNNELD_DEFAULT_ADDRESS[0]}:{TUNNELD_DEFAULT_ADDRESS[1]}/hello") as response:
-                if response.status != 200:
-                    return False
-                data = await response.json()
-                return data.get("message") == "Hello, I'm alive"
-    except Exception:
-        return False
-
-async def shutdown_tunneld():
-    if await is_tunneld_running():
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://{TUNNELD_DEFAULT_ADDRESS[0]}:{TUNNELD_DEFAULT_ADDRESS[1]}/shutdown") as response:
-                    if response.status != 200:
-                        raise RuntimeError("Status code was " + str(response.status))
-                    print("tunneld shutdown request successful")
-        except Exception as e:
-            print("Failed tunneld teardown", e)
-
-async def ensure_tunneld_running():
-    if not await is_tunneld_running():
-        await start_tunneld()
-        print("tunneld is not running - starting")
-    else:
-        print("tunneld is already running")
-
-
 async def _start_forwarder(forwarder, listen_event):
     """Start a forwarder task and wait for it to begin listening.
 
@@ -277,24 +223,19 @@ async def _start_forwarder(forwarder, listen_event):
 
 
 async def debugserver_connect(id, lockdown, port, ipc_client):
-    try:
-        discovery_service = await get_tunneld_device_by_udid(lockdown.udid)
-        if not discovery_service:
-            raise TunneldConnectionError()
-    except TunneldConnectionError:
-        await ipc_client.write_reply({"id": id, "state": "failed_no_tunneld"})
-        return
-
-    if Version(discovery_service.product_version) < Version('17.0'):
+    if Version(lockdown.product_version) < Version('17.0'):
         service_name = 'com.apple.debugserver.DVTSecureSocketProxy'
     else:
         service_name = 'com.apple.internal.dt.remote.debugproxy'
 
+    # The dispatch lockdown is closed once this handler returns, so the forwarder gets its own
+    # service provider that outlives it (closed in TcpForwarderResource.close).
+    service_provider = await create_using_usbmux(lockdown.udid)
     listen_event = asyncio.Event()
-    forwarder = LockdownTcpForwarder(discovery_service, port, service_name, listening_event=listen_event)
+    forwarder = LockdownTcpForwarder(service_provider, port, service_name, listening_event=listen_event)
     task = await _start_forwarder(forwarder, listen_event)
     resolved_port = forwarder.listening_port
-    ipc_client.add_forwarder(resolved_port, TcpForwarderResource(forwarder, task))
+    ipc_client.add_forwarder(resolved_port, TcpForwarderResource(forwarder, task, service_provider))
 
     await ipc_client.write_reply({"id": id, "state": "completed", "result": {
         "host": "127.0.0.1",
@@ -346,7 +287,6 @@ async def handle_command(command, ipc_client):
         command_type = res['command']
         if command_type == "exit":
             print(f"Exiting by request from {ipc_client.address}")
-            await shutdown_tunneld()
             # Signal the server loop to shut down gracefully.
             if _shutdown_event is not None:
                 _shutdown_event.set()
@@ -366,12 +306,6 @@ async def handle_command(command, ipc_client):
             await usbmux_forward_open(id, res['device_id'], res['remote_port'], res['local_port'], ipc_client)
         elif command_type == "usbmux_forwarder_close":
             await usbmux_forward_close(id, res['local_port'], ipc_client)
-        elif command_type == "ensure_tunneld_running":
-            await ensure_tunneld_running()
-            await ipc_client.write_reply({"id": id, "state": "completed"})
-        elif command_type == "is_tunneld_running":
-            result = await is_tunneld_running()
-            await ipc_client.write_reply({"id": id, "state": "completed", "result": result})
         elif command_type == "get_version":
             await get_version(id, ipc_client)
         elif command_type == "get_bundle_identifier":
